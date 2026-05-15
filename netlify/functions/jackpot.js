@@ -1,14 +1,22 @@
 /**
  * Netlify Serverless Function — jackpot.js
- * Estratégia Mega Power — v5.0 — 15/05/2026
+ * Estratégia Mega Power — v7.0 — 15/05/2026
  *
- * FONTE: Virginia Lottery (valottery.com)
- * Testada e confirmada: retorna Powerball $86mi e Mega Millions $251mi corretamente.
- * Sem autenticação. Sem scraping frágil. Parser calibrado para o formato exato do site.
+ * FONTES (cascata):
+ * 1. Texas Lottery — atualiza manhã seguinte ao sorteio, formato limpo
+ * 2. NC Lottery — fallback confiável
+ * 3. Virginia Lottery — fallback final
  *
  * CÂMBIO: exchangerate-api.com (gratuito, sem auth)
- * FALLBACK DE DATA: calendário fixo EDT quando o site não retorna data
  */
+
+const TX_PB = "https://www.texaslottery.com/export/sites/lottery/Games/Powerball/index.html";
+const TX_MM = "https://www.texaslottery.com/export/sites/lottery/Games/Mega_Millions/index.html";
+const NC_PB = "https://nclottery.com/powerball";
+const NC_MM = "https://nclottery.com/megamillions";
+const VA_PB = "https://www.valottery.com/data/draw-games/powerball";
+
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 exports.handler = async function (event, context) {
   const headers = {
@@ -23,11 +31,7 @@ exports.handler = async function (event, context) {
   }
 
   try {
-    const [fx, lotteries] = await Promise.all([
-      getFxRate(),
-      getLotteryData(),
-    ]);
-
+    const [fx, lotteries] = await Promise.all([getFxRate(), getLotteryData()]);
     return {
       statusCode: 200,
       headers,
@@ -46,8 +50,8 @@ exports.handler = async function (event, context) {
       headers,
       body: JSON.stringify({
         fx: 5.80,
-        powerball: { jackpot: null, nextDraw: getNextDrawDate("powerball") },
-        megamillions: { jackpot: null, nextDraw: getNextDrawDate("megamillions") },
+        powerball: { jackpot: null, nextDraw: nextDate("powerball") },
+        megamillions: { jackpot: null, nextDraw: nextDate("megamillions") },
         source: "error",
       }),
     };
@@ -62,10 +66,7 @@ async function getFxRate() {
     "https://open.er-api.com/v6/latest/USD",
   ]) {
     try {
-      const r = await fetch(url, {
-        headers: { "User-Agent": "MegaPower/5.0" },
-        signal: AbortSignal.timeout(5000),
-      });
+      const r = await fetch(url, { headers: { "User-Agent": "MegaPower/7.0" }, signal: AbortSignal.timeout(5000) });
       if (!r.ok) continue;
       const d = await r.json();
       const rate = d.rates?.BRL ?? d.conversion_rates?.BRL;
@@ -78,108 +79,167 @@ async function getFxRate() {
 // ─── JACKPOT ─────────────────────────────────────────────────────────────────
 
 async function getLotteryData() {
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-  // Fonte 1: página do Powerball na VA Lottery (tem PB + MM no mesmo HTML)
+  // ── FONTE 1: Texas Lottery ────────────────────────────────────────────────
+  // Formato exato: "Current Est. Annuitized Jackpot for MM/DD/YYYY:\n$86 Million"
   try {
-    const r = await fetch("https://www.valottery.com/data/draw-games/powerball", {
-      headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9" },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (r.ok) {
-      const html = await r.text();
-      const pb = extractGame(html, "powerball");
-      const mm = extractGame(html, "megamillions");
-      if (pb.jackpot || mm.jackpot) {
-        return { powerball: pb, megamillions: mm, source: "va-lottery-pb-page" };
-      }
+    const [pbR, mmR] = await Promise.allSettled([
+      get(TX_PB), get(TX_MM)
+    ]);
+    const pb = pbR.status === "fulfilled" ? parseTX(pbR.value, "powerball") : null;
+    const mm = mmR.status === "fulfilled" ? parseTX(mmR.value, "megamillions") : null;
+    if (pb?.jackpot || mm?.jackpot) {
+      return {
+        powerball: pb || { jackpot: null, nextDraw: nextDate("powerball") },
+        megamillions: mm || { jackpot: null, nextDraw: nextDate("megamillions") },
+        source: "tx-lottery",
+      };
     }
-  } catch (e) { console.warn("VA PB page:", e.message); }
+  } catch (e) { console.warn("TX:", e.message); }
 
-  // Fonte 2: página do Mega Millions (fallback)
+  // ── FONTE 2: NC Lottery ───────────────────────────────────────────────────
+  // Formato: "Jackpot Estimate $86 Million" / "Next Drawing Saturday, May. 16"
   try {
-    const r = await fetch("https://www.valottery.com/data/draw-games/megamillions", {
-      headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9" },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (r.ok) {
-      const html = await r.text();
-      const pb = extractGame(html, "powerball");
-      const mm = extractGame(html, "megamillions");
-      if (pb.jackpot || mm.jackpot) {
-        return { powerball: pb, megamillions: mm, source: "va-lottery-mm-page" };
-      }
+    const [pbR, mmR] = await Promise.allSettled([
+      get(NC_PB), get(NC_MM)
+    ]);
+    const pb = pbR.status === "fulfilled" ? parseNC(pbR.value, "powerball") : null;
+    const mm = mmR.status === "fulfilled" ? parseNC(mmR.value, "megamillions") : null;
+    if (pb?.jackpot || mm?.jackpot) {
+      return {
+        powerball: pb || { jackpot: null, nextDraw: nextDate("powerball") },
+        megamillions: mm || { jackpot: null, nextDraw: nextDate("megamillions") },
+        source: "nc-lottery",
+      };
     }
-  } catch (e) { console.warn("VA MM page:", e.message); }
+  } catch (e) { console.warn("NC:", e.message); }
 
-  // Fallback final: sem jackpot, só datas pelo calendário
+  // ── FONTE 3: Virginia Lottery ─────────────────────────────────────────────
+  // Formato: "$251 MILLION ... Next Drawing: Fri 05/15/2026"
+  try {
+    const html = await get(VA_PB);
+    const pb = parseVA(html, "powerball");
+    const mm = parseVA(html, "megamillions");
+    if (pb.jackpot || mm.jackpot) {
+      return { powerball: pb, megamillions: mm, source: "va-lottery" };
+    }
+  } catch (e) { console.warn("VA:", e.message); }
+
   return {
-    powerball: { jackpot: null, nextDraw: getNextDrawDate("powerball") },
-    megamillions: { jackpot: null, nextDraw: getNextDrawDate("megamillions") },
+    powerball: { jackpot: null, nextDraw: nextDate("powerball") },
+    megamillions: { jackpot: null, nextDraw: nextDate("megamillions") },
     source: "calendar-fallback",
   };
 }
 
-// ─── PARSER ──────────────────────────────────────────────────────────────────
-//
-// O HTML da VA Lottery contém blocos como:
-//   "mega millionsCurrent Estimated Jackpot$251 MILLION ... Next Drawing: Fri 05/15/2026"
-//   "PowerballCurrent Estimated Jackpot$86 MILLION ... Next Drawing: Sat 05/16/2026"
-//
-// Estratégia: encontrar posição do jogo, extrair substring até o próximo jogo.
+// ─── FETCH HELPER ─────────────────────────────────────────────────────────────
 
-function extractGame(html, type) {
+async function get(url) {
+  const r = await fetch(url, {
+    headers: { "User-Agent": UA, "Accept": "text/html", "Accept-Language": "en-US,en;q=0.9" },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  return r.text();
+}
+
+// ─── PARSER: TEXAS LOTTERY ────────────────────────────────────────────────────
+// "Current Est. Annuitized Jackpot for 05/16/2026: $86 Million"
+
+function parseTX(html, type) {
+  let jackpot = null;
+  let nextDraw = null;
+
+  // Jackpot
+  const bil = html.match(/Current Est\..*?Jackpot[^$]*\$([\d,.]+)\s*Billion/is);
+  if (bil) jackpot = Math.round(parseFloat(bil[1].replace(/,/g, "")) * 1e9);
+
+  if (!jackpot) {
+    const mil = html.match(/Current Est\..*?Jackpot[^$]*\$([\d,.]+)\s*Million/is);
+    if (mil) jackpot = Math.round(parseFloat(mil[1].replace(/,/g, "")) * 1e6);
+  }
+
+  // Data do sorteio: "for MM/DD/YYYY"
+  const dm = html.match(/for\s+(\d{2}\/\d{2}\/\d{4})/i);
+  if (dm) {
+    const [mo, dd, yyyy] = dm[1].split("/");
+    nextDraw = `${yyyy}-${mo}-${dd}T22:59:00`;
+  }
+
+  if (!nextDraw) nextDraw = nextDate(type);
+  return jackpot ? { jackpot, nextDraw } : null;
+}
+
+// ─── PARSER: NC LOTTERY ───────────────────────────────────────────────────────
+// "Jackpot Estimate $86 Million" / "Next Drawing Saturday, May. 16, 10:59 PM"
+
+function parseNC(html, type) {
+  let jackpot = null;
+  let nextDraw = null;
+
+  const bil = html.match(/Jackpot Estimate[^$]*\$([\d,.]+)\s*Billion/i);
+  if (bil) jackpot = Math.round(parseFloat(bil[1].replace(/,/g, "")) * 1e9);
+  if (!jackpot) {
+    const mil = html.match(/Jackpot Estimate[^$]*\$([\d,.]+)\s*Million/i);
+    if (mil) jackpot = Math.round(parseFloat(mil[1].replace(/,/g, "")) * 1e6);
+  }
+
+  // "Next Drawing Saturday, May. 16, 10:59 PM"
+  const dm = html.match(/Next Drawing\s+\w+,\s+(\w+)\.?\s+(\d{1,2})/i);
+  if (dm) {
+    const months = {Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12};
+    const mo = months[dm[1].substring(0,3)];
+    const dd = parseInt(dm[2], 10);
+    if (mo && dd) {
+      const yyyy = new Date().getFullYear();
+      nextDraw = `${yyyy}-${String(mo).padStart(2,"0")}-${String(dd).padStart(2,"0")}T22:59:00`;
+    }
+  }
+
+  if (!nextDraw) nextDraw = nextDate(type);
+  return jackpot ? { jackpot, nextDraw } : null;
+}
+
+// ─── PARSER: VIRGINIA LOTTERY ────────────────────────────────────────────────
+// "$251 MILLION ... Next Drawing: Fri 05/15/2026"
+
+function parseVA(html, type) {
   const isPB = type === "powerball";
-
-  // Localizar início do bloco
   const startRx = isPB ? /Powerball(?:Current|\s)/i : /mega\s+millions(?:Current|\s)/i;
   const startMatch = html.match(startRx);
-  if (!startMatch) return { jackpot: null, nextDraw: getNextDrawDate(type) };
+  if (!startMatch) return { jackpot: null, nextDraw: nextDate(type) };
 
   const start = startMatch.index;
-
-  // Localizar fim do bloco (próximo jogo diferente)
-  const endRx = isPB
-    ? /mega\s+millions/i
-    : /Powerball/i;
-
-  const afterStart = html.substring(start + 15);
-  const endMatch = afterStart.match(endRx);
+  const endRx = isPB ? /mega\s+millions/i : /Powerball/i;
+  const after = html.substring(start + 15);
+  const endMatch = after.match(endRx);
   const end = endMatch ? start + 15 + endMatch.index : Math.min(start + 800, html.length);
-
   const block = html.substring(start, end);
 
-  // Jackpot — formato "$251 MILLION" ou "$1.2 BILLION"
   let jackpot = null;
   const bil = block.match(/\$([\d,.]+)\s*BILLION/i);
   if (bil) jackpot = Math.round(parseFloat(bil[1].replace(/,/g, "")) * 1e9);
-
   if (!jackpot) {
     const mil = block.match(/\$([\d,.]+)\s*MILLION/i);
     if (mil) jackpot = Math.round(parseFloat(mil[1].replace(/,/g, "")) * 1e6);
   }
 
-  // Data — formato "Next Drawing: Sat 05/16/2026"
   let nextDraw = null;
   const dm = block.match(/Next Drawing[:\s]+\w{3}\s+(\d{2}\/\d{2}\/\d{4})/i);
   if (dm) {
     const [mo, dd, yyyy] = dm[1].split("/");
     nextDraw = `${yyyy}-${mo}-${dd}T22:59:00`;
   }
-
-  if (!nextDraw) nextDraw = getNextDrawDate(type);
-
+  if (!nextDraw) nextDraw = nextDate(type);
   return { jackpot, nextDraw };
 }
 
 // ─── CALENDÁRIO FIXO ─────────────────────────────────────────────────────────
-// Powerball: seg(1), qua(3), sáb(6) | Mega Millions: ter(2), sex(5)
-// EDT = UTC-4 (vigente mai–nov)
+// Powerball: seg(1), qua(3), sáb(6) | Mega Millions: ter(2), sex(5) | EDT=UTC-4
 
-function getNextDrawDate(type) {
+function nextDate(type) {
   const days = type === "powerball" ? [1, 3, 6] : [2, 5];
   const etNow = new Date(Date.now() + (-4 * 60 * 60 * 1000));
-
   for (let i = 0; i < 7; i++) {
     const d = new Date(etNow);
     d.setDate(d.getDate() + i);
